@@ -123,7 +123,22 @@ def leer_placa(recorte: np.ndarray, ocr: PaddleOCR) -> str | None:
     return resultados
 
 
-async def loop_camara(modelo_yolo: YOLO, ocr: PaddleOCR, fuente, stop_event: asyncio.Event):
+def detectar_y_leer(frame: np.ndarray, modelo_yolo: YOLO, ocr: PaddleOCR) -> list[dict]:
+    """YOLO + OCR combinados. Usado por analizar_imagen y loop_camara."""
+    resultados = []
+    for rec in detectar_placas(frame, modelo_yolo):
+        numero = leer_placa(rec["recorte"], ocr)
+        if numero is None:
+            continue
+        resultados.append({
+            "placa":     numero,
+            "confianza": rec["confianza"],
+            "bbox":      rec["bbox"],
+        })
+    return resultados
+
+
+(modelo_yolo: YOLO, ocr: PaddleOCR, fuente, stop_event: asyncio.Event):
     cap = cv2.VideoCapture(fuente)
 
     if not cap.isOpened():
