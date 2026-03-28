@@ -29,8 +29,8 @@ def preprocesar(imagen: np.ndarray) -> np.ndarray:
 
 
 def detectar_placas(frame: np.ndarray, modelo_yolo: YOLO) -> list[dict]:
-    """Solo YOLO: devuelve los recortes de placas detectadas sin pasar al OCR."""
-    recortes   = []
+    """Solo YOLO: devuelve recortes de placas detectadas sin pasar al OCR."""
+    recortes    = []
     detecciones = modelo_yolo(frame, verbose=False)
 
     for det in detecciones:
@@ -78,51 +78,6 @@ def leer_placa(recorte: np.ndarray, ocr: PaddleOCR) -> str | None:
     return texto_limpio
 
 
-
-    resultados  = []
-    detecciones = modelo_yolo(frame, verbose=False)
-
-    for det in detecciones:
-        for box in det.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            confianza = float(box.conf[0])
-
-            if confianza < 0.5:
-                continue
-
-            recorte = frame[y1:y2, x1:x2]
-            if recorte.size == 0:
-                continue
-
-            recorte_procesado = preprocesar(recorte)
-
-            resultado_ocr = ocr.predict(recorte_procesado)
-            if not resultado_ocr or not resultado_ocr[0]:
-                continue
-
-            texto = ""
-            res = resultado_ocr[0]
-            textos = res.get("rec_texts", [])
-            scores = res.get("rec_scores", [])
-            for t, s in zip(textos, scores):
-                if s >= 0.6:
-                    texto += t
-
-            texto_limpio = "".join(c for c in texto.upper() if c.isalnum())
-
-            # validar con regex que coincida con formato de placa mexicana
-            if not _PATRON_PLACA.match(texto_limpio):
-                continue
-
-            resultados.append({
-                "placa":     texto_limpio,
-                "confianza": round(confianza, 2),
-                "bbox":      [x1, y1, x2, y2]
-            })
-
-    return resultados
-
-
 def detectar_y_leer(frame: np.ndarray, modelo_yolo: YOLO, ocr: PaddleOCR) -> list[dict]:
     """YOLO + OCR combinados. Usado por analizar_imagen y loop_camara."""
     resultados = []
@@ -138,7 +93,7 @@ def detectar_y_leer(frame: np.ndarray, modelo_yolo: YOLO, ocr: PaddleOCR) -> lis
     return resultados
 
 
-(modelo_yolo: YOLO, ocr: PaddleOCR, fuente, stop_event: asyncio.Event):
+async def loop_camara(modelo_yolo: YOLO, ocr: PaddleOCR, fuente, stop_event: asyncio.Event):
     cap = cv2.VideoCapture(fuente)
 
     if not cap.isOpened():
