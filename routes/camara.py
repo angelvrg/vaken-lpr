@@ -21,7 +21,7 @@ router = APIRouter()
 
 
 def _verificar_modelos(request: Request):
-    if request.app.state.yolo is None or request.app.state.ocr is None:
+    if request.app.state.yolo is None or request.app.state.ocr_rapido is None:
         raise HTTPException(
             status_code=503,
             detail="Modelo YOLO no cargado. Coloca modelo_placas.pt y reinicia la API."
@@ -44,7 +44,7 @@ async def iniciar_camara(request: Request, datos: CamaraIniciar = CamaraIniciar(
     stop_event = asyncio.Event()
     request.app.state.camara_stop = stop_event
     request.app.state.camara_task = asyncio.create_task(
-        loop_camara(request.app.state.yolo, request.app.state.ocr, fuente, stop_event)
+        loop_camara(request.app.state.yolo, request.app.state.ocr_rapido, request.app.state.ocr_completo, fuente, stop_event)
     )
 
     return {"mensaje": "Camara iniciada.", "fuente": str(fuente)}
@@ -75,7 +75,7 @@ async def analizar_imagen(request: Request, imagen: UploadFile = File(...)):
             detail="No se pudo decodificar la imagen. Asegurate de enviar un archivo valido (jpg, png, etc.)."
         )
 
-    detecciones = detectar_y_leer(frame, request.app.state.yolo, request.app.state.ocr)
+    detecciones = detectar_y_leer(frame, request.app.state.yolo, request.app.state.ocr_rapido, request.app.state.ocr_completo)
 
     resultados = []
     for det in detecciones:
@@ -135,7 +135,7 @@ async def analizar_video(request: Request, video: UploadFile = File(...)):
 
         # 2. Solo los frames con placa pasan al OCR
         for rec in recortes:
-            numero = leer_placa(rec["recorte"], request.app.state.ocr)
+            numero = leer_placa(rec["recorte"], request.app.state.ocr_rapido, request.app.state.ocr_completo)
             if numero is None or numero in placas_vistas:
                 continue
 
