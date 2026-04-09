@@ -3,13 +3,25 @@ TENAX-LPR - Backend API
 FastAPI + YOLO + OpenCV + PaddleOCR + PostgreSQL
 """
 
+import os
+import logging
+
+# Silenciar todos los sistemas de log de Paddle antes de importar
+os.environ["DISABLE_AUTO_LOGGING_CONFIG"] = "1"
+os.environ["PADDLE_PDX_LOG_LEVEL"] = "ERROR"
+
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
-from paddleocr import PaddleOCR, TextRecognition
+from paddleocr import TextRecognition, logger
+
+# Asegurar niveles de log por si acaso
+logger.setLevel(logging.ERROR)
+for name in ("paddlex", "paddle", "ppocr"):
+    logging.getLogger(name).setLevel(logging.ERROR)
 
 from config import MODEL_PATH
 from database import iniciar_bd
@@ -28,25 +40,13 @@ async def lifespan(app: FastAPI):
     if Path(MODEL_PATH).exists():
         app.state.yolo = YOLO(MODEL_PATH)
 
-        # OCR rápido: solo reconocimiento mobile (ruta principal)
-        app.state.ocr_rapido = TextRecognition(
-            model_name="PP-OCRv5_mobile_rec",
-        )
-
-        # OCR completo: detección server + reconocimiento mobile (fallback)
-        app.state.ocr_completo = PaddleOCR(
-            text_detection_model_name="PP-OCRv5_server_det",
-            text_recognition_model_name="PP-OCRv5_mobile_rec",
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-        )
+        # Usamos el modelo ultra rápido nativo en inglés para evitar alucinaciones
+        app.state.ocr = TextRecognition(model_name="en_PP-OCRv4_mobile_rec")
 
         print("Modelos cargados. Usa POST /camara/iniciar para abrir la camara.")
     else:
-        app.state.yolo         = None
-        app.state.ocr_rapido   = None
-        app.state.ocr_completo = None
+        app.state.yolo = None
+        app.state.ocr  = None
         print(f"Modelo '{MODEL_PATH}' no encontrado. Solo CRUD disponible.")
 
     yield

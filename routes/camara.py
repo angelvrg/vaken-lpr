@@ -14,17 +14,17 @@ from fastapi import APIRouter, HTTPException, Request, UploadFile, File, WebSock
 
 from database import consultar_placa, guardar_historial
 from schemas import CamaraIniciar
-from vision import detectar_y_leer, detectar_placas, leer_placa, loop_camara
+from vision import detectar_y_leer, detectar_placas, leer_placa, loop_camara, es_misma_placa
 from websocket import manager
 
 router = APIRouter()
 
 
 def _verificar_modelos(request: Request):
-    if request.app.state.yolo is None or request.app.state.ocr_rapido is None:
+    if request.app.state.yolo is None or request.app.state.ocr is None:
         raise HTTPException(
             status_code=503,
-            detail="Modelo YOLO no cargado. Coloca modelo_placas.pt y reinicia la API."
+            detail="Modelos no cargados. Revisa la consola al iniciar."
         )
 
 
@@ -44,7 +44,7 @@ async def iniciar_camara(request: Request, datos: CamaraIniciar = CamaraIniciar(
     stop_event = asyncio.Event()
     request.app.state.camara_stop = stop_event
     request.app.state.camara_task = asyncio.create_task(
-        loop_camara(request.app.state.yolo, request.app.state.ocr_rapido, request.app.state.ocr_completo, fuente, stop_event)
+        loop_camara(request.app.state.yolo, request.app.state.ocr, fuente, stop_event)
     )
 
     return {"mensaje": "Camara iniciada.", "fuente": str(fuente)}
@@ -75,7 +75,7 @@ async def analizar_imagen(request: Request, imagen: UploadFile = File(...)):
             detail="No se pudo decodificar la imagen. Asegurate de enviar un archivo valido (jpg, png, etc.)."
         )
 
-    detecciones = detectar_y_leer(frame, request.app.state.yolo, request.app.state.ocr_rapido, request.app.state.ocr_completo)
+    detecciones = detectar_y_leer(frame, request.app.state.yolo, request.app.state.ocr)
 
     resultados = []
     for det in detecciones:
@@ -121,22 +121,50 @@ async def analizar_video(request: Request, video: UploadFile = File(...)):
 
     placas_vistas = {}
     frame_num     = 0
+    # BALANCE PERFECTO: Saltamos 4 frames. Es lo bastante rápido y captura mucha información.
+    frame_skip    = 4
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-
-        # 1. YOLO revisa cada frame — solo continúa si detecta una placa
-        recortes = detectar_placas(frame, request.app.state.yolo)
-        if not recortes:
-            frame_num += 1
+            
+        frame_num += 1
+        
+        if frame_num % frame_skip != 0:
             continue
 
-        # 2. Solo los frames con placa pasan al OCR
+        recortes = detectar_placas(frame, request.app.state.yolo)
+        if not recortes:
+            continue
+
         for rec in recortes:
-            numero = leer_placa(rec["recorte"], request.app.state.ocr_rapido, request.app.state.ocr_completo)
-            if numero is None or numero in placas_vistas:
+            numero = leer_placa(rec["recorte"], request.app.state.ocr)
+            if numero is None:
+                continue
+
+            placa_similar = None
+            for guardada in placas_vistas.keys():
+                if es_misma_placa(numero, [guardada]):
+                    placa_similar = guardada
+                    break
+
+            if placa_similar:
+                confianza_actual = placas_vistas[placa_similar]["confianza"]
+                
+                es_mejor = len(numero) > len(placa_similar) or (
+                    len(numero) == len(placa_similar) and rec["confianza"] > confianza_actual
+                )
+                
+                if es_mejor:
+                    datos = placas_vistas.pop(placa_similar)
+                    info = consultar_placa(numero)
+                    datos.update({
+                        **info, 
+                        "placa": numero, 
+                        "confianza": rec["confianza"]
+                    })
+                    placas_vistas[numero] = datos
                 continue
 
             info = consultar_placa(numero)
@@ -153,8 +181,6 @@ async def analizar_video(request: Request, video: UploadFile = File(...)):
                 **info,
                 "confianza": rec["confianza"],
             })
-
-        frame_num += 1
 
     cap.release()
     os.unlink(ruta_tmp)
