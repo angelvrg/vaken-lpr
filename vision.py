@@ -103,42 +103,58 @@ def corregir_lectura(texto: str) -> str:
     return "".join(caracteres)
 
 
+def _parsear_resultado_ocr(res) -> str | None:
+    """Extrae texto y puntuación de un resultado individual de PaddleOCR v3.
+
+    Devuelve el texto limpio si la puntuación es suficiente, o None en caso contrario.
+    Compatible tanto con resultados de tipo dict como con objetos con atributos.
+    """
+    t = ""
+    s = 0.0
+
+    if isinstance(res, dict):
+        t = res.get("rec_text", "")
+        s = res.get("rec_score", 0.0)
+        if not t and "rec_texts" in res:
+            t = res["rec_texts"][0] if res["rec_texts"] else ""
+            s = res["rec_scores"][0] if res["rec_scores"] else 0.0
+    else:
+        t = getattr(res, "rec_text", "")
+        s = getattr(res, "rec_score", 0.0)
+        if not t and hasattr(res, "rec_texts"):
+            t = res.rec_texts[0] if res.rec_texts else ""
+            s = res.rec_scores[0] if res.rec_scores else 0.0
+
+    if s < 0.35:
+        return None
+
+    texto_limpio = "".join(c for c in t.upper() if c.isalnum())
+    return corregir_lectura(texto_limpio) if texto_limpio else None
+
+
 def leer_placa(recorte: np.ndarray, ocr: TextRecognition) -> str | None:
+    """Lee una única placa. Conservado para compatibilidad con routes/camara.py."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     recorte_procesado = preprocesar(recorte)
 
     try:
         resultados = list(ocr.predict(recorte_procesado))
     except Exception as e:
-        if MOSTRAR_LOGS_OCR: print(f"{C_ROJO}Error OCR: {e}{C_RESET}")
+        if MOSTRAR_LOGS_OCR:
+            print(f"{C_ROJO}Error OCR: {e}{C_RESET}")
         return None
 
     if not resultados:
         return None
 
-    texto_crudo = ""
+    texto_acumulado = ""
     for res in resultados:
-        t = ""
-        s = 0.0
-        if isinstance(res, dict):
-            t = res.get("rec_text", "")
-            s = res.get("rec_score", 0.0)
-            if not t and "rec_texts" in res:
-                t = res["rec_texts"][0] if res["rec_texts"] else ""
-                s = res["rec_scores"][0] if res["rec_scores"] else 0.0
-        else:
-            t = getattr(res, "rec_text", "")
-            s = getattr(res, "rec_score", 0.0)
-            if not t and hasattr(res, "rec_texts"):
-                t = res.rec_texts[0] if res.rec_texts else ""
-                s = res.rec_scores[0] if res.rec_scores else 0.0
+        parte = _parsear_resultado_ocr(res)
+        if parte:
+            texto_acumulado += parte
 
-        if s >= 0.35:
-            texto_crudo += t
+    texto_corregido = texto_acumulado
 
-    texto_limpio = "".join(c for c in texto_crudo.upper() if c.isalnum())
-    texto_corregido = corregir_lectura(texto_limpio)
-    
     if _PATRON_PLACA.match(texto_corregido):
         if MOSTRAR_LOGS_OCR:
             print(f"{C_VERDE}[MATCH VIDEO/CAM] Placa válida encontrada: {texto_corregido}{C_RESET}")
@@ -148,22 +164,75 @@ def leer_placa(recorte: np.ndarray, ocr: TextRecognition) -> str | None:
 
     if GUARDAR_RECORTES and texto_corregido:
         cv2.imwrite(f"{CARPETA_RECORTES}/{timestamp}_FALLO_{texto_corregido}.jpg", recorte_procesado)
-        
+
     return None
 
 
-def detectar_y_leer(frame: np.ndarray, modelo_yolo: YOLO, ocr: TextRecognition) -> list[dict]:
-    resultados = []
-    for rec in detectar_placas(frame, modelo_yolo):
-        numero = leer_placa(recorte=rec["recorte"], ocr=ocr)
-        if numero is None:
+def _procesar_resultados_batch(
+    resultados_batch,
+    recortes_info: list[dict],
+) -> list[dict]:
+    """Convierte la salida batch del OCR en detecciones con número de placa.
+
+    En PaddleOCR v3 `predict([img1, img2, ...])` devuelve un iterable donde
+    cada elemento corresponde a la imagen enviada en el mismo índice.
+    """
+    detecciones = []
+    for i, res in enumerate(resultados_batch):
+        # Cada resultado puede ser un dict simple o un objeto
+        parte = _parsear_resultado_ocr(res)
+        if not parte:
             continue
-        resultados.append({
-            "placa":     numero,
-            "confianza": rec["confianza"],
-            "bbox":      rec["bbox"],
+
+        texto_corregido = parte
+        if not _PATRON_PLACA.match(texto_corregido):
+            continue
+
+        if MOSTRAR_LOGS_OCR:
+            print(f"{C_VERDE}[BATCH] Placa válida: {texto_corregido}{C_RESET}")
+
+        detecciones.append({
+            "placa":     texto_corregido,
+            "confianza": recortes_info[i]["confianza"],
+            "bbox":      recortes_info[i]["bbox"],
         })
-    return resultados
+
+    return detecciones
+
+
+def detectar_y_leer(frame: np.ndarray, modelo_yolo: YOLO, ocr: TextRecognition) -> list[dict]:
+    """Detecta placas con YOLO y las lee con OCR en un único paso batch.
+
+    Enviar todos los recortes preprocesados en una sola llamada a ``ocr.predict()``
+    reduce drásticamente la sobrecarga de inicialización de inferencia por frame,
+    siendo la optimización de mayor impacto en PaddleOCR v3 respecto a llamadas
+    individuales por cada recorte.
+    """
+    recortes_info = detectar_placas(frame, modelo_yolo)
+    if not recortes_info:
+        return []
+
+    imagenes_procesadas = [preprocesar(r["recorte"]) for r in recortes_info]
+
+    # --- BATCH OCR: una sola llamada para todos los recortes del frame ---
+    try:
+        resultados_batch = list(ocr.predict(imagenes_procesadas))
+    except Exception as e:
+        if MOSTRAR_LOGS_OCR:
+            print(f"{C_ROJO}Error OCR batch: {e}{C_RESET}")
+        # Fallback: procesar uno a uno
+        resultados_fallback = []
+        for rec in recortes_info:
+            numero = leer_placa(rec["recorte"], ocr)
+            if numero:
+                resultados_fallback.append({
+                    "placa":     numero,
+                    "confianza": rec["confianza"],
+                    "bbox":      rec["bbox"],
+                })
+        return resultados_fallback
+
+    return _procesar_resultados_batch(resultados_batch, recortes_info)
 
 
 async def loop_camara(modelo_yolo: YOLO, ocr: TextRecognition, fuente, stop_event: asyncio.Event):

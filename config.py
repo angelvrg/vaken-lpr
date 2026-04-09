@@ -12,3 +12,9 @@ DB_CONFIG = {
     "user":     "postgres",
     "password": "admin-A1",  # cambia si tu contraseña es diferente
 }
+
+# --- CONFIGURACIÓN DE RENDIMIENTO OCR ---
+# Hilos de CPU que usará PaddleOCR para inferencia.
+# Aumentar este valor mejora la velocidad en máquinas con varios núcleos.
+# Recomendado: número de núcleos físicos disponibles (típicamente 4-8).
+OCR_CPU_THREADS = 4
