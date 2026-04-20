@@ -12,7 +12,6 @@ os.environ["PADDLE_PDX_LOG_LEVEL"] = "ERROR"
 
 from contextlib import asynccontextmanager
 from pathlib import Path
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
@@ -23,7 +22,7 @@ logger.setLevel(logging.ERROR)
 for name in ("paddlex", "paddle", "ppocr"):
     logging.getLogger(name).setLevel(logging.ERROR)
 
-from config import MODEL_PATH, OCR_CPU_THREADS
+from config import MODEL_PATH
 from database import iniciar_bd
 from routes.consulta import router as router_consulta
 from routes.vehiculos import router as router_vehiculos
@@ -41,11 +40,7 @@ async def lifespan(app: FastAPI):
         app.state.yolo = YOLO(MODEL_PATH)
 
         # Modelo ultra rápido nativo en inglés.
-        # cpu_num_threads: incrementa la paralelización en CPU para mayor velocidad.
-        app.state.ocr = TextRecognition(
-            model_name="en_PP-OCRv4_mobile_rec",
-            cpu_num_threads=OCR_CPU_THREADS,
-        )
+        app.state.ocr = TextRecognition(model_name="en_PP-OCRv4_mobile_rec")
 
         print("Modelos cargados. Usa POST /camara/iniciar para abrir la camara.")
     else:

@@ -121,8 +121,8 @@ async def analizar_video(request: Request, video: UploadFile = File(...)):
 
     placas_vistas = {}
     frame_num     = 0
-    # BALANCE PERFECTO: Saltamos 4 frames. Es lo bastante rápido y captura mucha información.
-    frame_skip    = 4
+    
+    frame_skip    = 10
 
     while True:
         ret, frame = cap.read()
