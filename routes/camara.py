@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException, Request, UploadFile, File, WebSock
 
 from database import consultar_placa, guardar_historial
 from schemas import CamaraIniciar
-from vision import detectar_y_leer, detectar_placas, leer_placa, loop_camara, es_misma_placa
+from vision import detectar_y_leer, detectar_placas_batch, leer_placas_batch, leer_placa, loop_camara, es_misma_placa
 from websocket import manager
 
 router = APIRouter()
@@ -103,92 +103,156 @@ async def analizar_imagen(request: Request, imagen: UploadFile = File(...)):
     }
 
 
-@router.post("/analizar-video")
-async def analizar_video(request: Request, video: UploadFile = File(...)):
-    _verificar_modelos(request)
+# ---------------------------------------------------------------------------
+# PROCESAMIENTO DE VIDEO (SÍNCRONO, EJECUTADO EN THREAD)
+# ---------------------------------------------------------------------------
 
-    contenido = await video.read()
-    sufijo    = Path(video.filename).suffix if video.filename else ".mp4"
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=sufijo) as tmp:
-        tmp.write(contenido)
-        ruta_tmp = tmp.name
-
+def _procesar_video_sync(ruta_tmp: str, yolo, ocr) -> dict:
+    """Lógica síncrona de procesamiento de video, ejecutada en un thread separado."""
     cap = cv2.VideoCapture(ruta_tmp)
     if not cap.isOpened():
-        os.unlink(ruta_tmp)
-        raise HTTPException(status_code=400, detail="No se pudo abrir el archivo de video.")
+        return {"error": "No se pudo abrir el archivo de video."}
 
     placas_vistas = {}
-    frame_num     = 0
-    
-    frame_skip    = 10
+    placas_set = set()
+    frame_num = 0
+    ultimo_tuvo_deteccion = False
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-            
+
         frame_num += 1
-        
+
+        # Frame skip adaptativo
+        frame_skip = 5 if ultimo_tuvo_deteccion else 20
         if frame_num % frame_skip != 0:
             continue
 
-        recortes = detectar_placas(frame, request.app.state.yolo)
-        if not recortes:
-            continue
+        # Batch YOLO: acumular frames y procesar en batch
+        frames_buffer = [frame]
+        for _ in range(3):
+            ret_next, frame_next = cap.read()
+            if not ret_next:
+                break
+            frame_num += 1
+            frames_buffer.append(frame_next)
 
-        for rec in recortes:
-            numero = leer_placa(rec["recorte"], request.app.state.ocr)
-            if numero is None:
+        resultados_yolo = detectar_placas_batch(frames_buffer, yolo)
+        ultimo_tuvo_deteccion = any(len(r) > 0 for r in resultados_yolo)
+
+        for idx, recortes in enumerate(resultados_yolo):
+            if not recortes:
                 continue
 
-            placa_similar = None
-            for guardada in placas_vistas.keys():
-                if es_misma_placa(numero, [guardada]):
-                    placa_similar = guardada
-                    break
+            try:
+                recortes_np = [r["recorte"] for r in recortes]
+                textos = leer_placas_batch(recortes_np, ocr)
+            except Exception:
+                textos = [leer_placa(r["recorte"], ocr) for r in recortes]
 
-            if placa_similar:
-                confianza_actual = placas_vistas[placa_similar]["confianza"]
-                
-                es_mejor = len(numero) > len(placa_similar) or (
-                    len(numero) == len(placa_similar) and rec["confianza"] > confianza_actual
-                )
-                
-                if es_mejor:
-                    datos = placas_vistas.pop(placa_similar)
-                    info = consultar_placa(numero)
-                    datos.update({
-                        **info, 
-                        "placa": numero, 
-                        "confianza": rec["confianza"]
-                    })
-                    placas_vistas[numero] = datos
-                continue
+            for rec, numero in zip(recortes, textos):
+                if numero is None:
+                    continue
 
-            info = consultar_placa(numero)
-            guardar_historial(numero, info["estado"])
-            placas_vistas[numero] = {
-                **info,
-                "confianza": rec["confianza"],
-                "frame":     frame_num,
-                "timestamp": datetime.now().isoformat(),
-            }
-            await manager.broadcast({
-                "tipo":      "deteccion",
-                "timestamp": datetime.now().isoformat(),
-                **info,
-                "confianza": rec["confianza"],
-            })
+                # Hit exacto con set O(1)
+                if numero in placas_set:
+                    confianza_actual = placas_vistas[numero]["confianza"]
+                    es_mejor = len(numero) > len(numero) or (
+                        len(numero) == len(numero) and rec["confianza"] > confianza_actual
+                    )
+                    if es_mejor:
+                        datos = placas_vistas[numero]
+                        datos.update({
+                            "confianza": rec["confianza"],
+                            "frame": frame_num - len(frames_buffer) + idx + 1,
+                        })
+                    continue
+
+                # Verificar similitud con placas existentes
+                placa_similar = None
+                for guardada in placas_vistas.keys():
+                    if es_misma_placa(numero, [guardada]):
+                        placa_similar = guardada
+                        break
+
+                if placa_similar:
+                    confianza_actual = placas_vistas[placa_similar]["confianza"]
+                    es_mejor = len(numero) > len(placa_similar) or (
+                        len(numero) == len(placa_similar) and rec["confianza"] > confianza_actual
+                    )
+                    if es_mejor:
+                        datos = placas_vistas.pop(placa_similar)
+                        info = consultar_placa(numero)
+                        datos.update({
+                            **info,
+                            "placa": numero,
+                            "confianza": rec["confianza"],
+                        })
+                        placas_vistas[numero] = datos
+                        placas_set.discard(placa_similar)
+                        placas_set.add(numero)
+                    continue
+
+                info = consultar_placa(numero)
+                guardar_historial(numero, info["estado"])
+                placas_vistas[numero] = {
+                    **info,
+                    "confianza": rec["confianza"],
+                    "frame": frame_num - len(frames_buffer) + idx + 1,
+                    "timestamp": datetime.now().isoformat(),
+                }
+                placas_set.add(numero)
 
     cap.release()
-    os.unlink(ruta_tmp)
 
     return {
-        "total_frames":     frame_num,
+        "total_frames": frame_num,
         "total_detectadas": len(placas_vistas),
-        "placas":           list(placas_vistas.values()),
+        "placas": list(placas_vistas.values()),
+    }
+
+
+@router.post("/analizar-video")
+async def analizar_video(request: Request, video: UploadFile = File(...)):
+    _verificar_modelos(request)
+
+    sufijo = Path(video.filename).suffix if video.filename else ".mp4"
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=sufijo) as tmp:
+        while True:
+            chunk = await video.read(1024 * 1024)
+            if not chunk:
+                break
+            tmp.write(chunk)
+        ruta_tmp = tmp.name
+
+    try:
+        resultado = await asyncio.to_thread(
+            _procesar_video_sync,
+            ruta_tmp,
+            request.app.state.yolo,
+            request.app.state.ocr,
+        )
+    finally:
+        os.unlink(ruta_tmp)
+
+    if "error" in resultado:
+        raise HTTPException(status_code=400, detail=resultado["error"])
+
+    # Broadcast de resultados tras finalizar el procesamiento
+    for datos in resultado["placas"]:
+        await manager.broadcast({
+            "tipo": "deteccion",
+            "timestamp": datos.get("timestamp", datetime.now().isoformat()),
+            **{k: v for k, v in datos.items() if k not in ("frame",)},
+        })
+
+    return {
+        "total_frames": resultado["total_frames"],
+        "total_detectadas": resultado["total_detectadas"],
+        "placas": resultado["placas"],
     }
 
 

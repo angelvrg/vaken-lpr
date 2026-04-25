@@ -22,8 +22,9 @@ logger.setLevel(logging.ERROR)
 for name in ("paddlex", "paddle", "ppocr"):
     logging.getLogger(name).setLevel(logging.ERROR)
 
-from config import MODEL_PATH
-from database import iniciar_bd
+import torch
+from config import MODEL_PATH, YOLO_DEVICE
+from database import iniciar_bd, init_pool
 from routes.consulta import router as router_consulta
 from routes.vehiculos import router as router_vehiculos
 from routes.camara import router as router_camara
@@ -31,6 +32,7 @@ from routes.camara import router as router_camara
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    init_pool()
     iniciar_bd()
 
     app.state.camara_task = None
@@ -38,9 +40,16 @@ async def lifespan(app: FastAPI):
 
     if Path(MODEL_PATH).exists():
         app.state.yolo = YOLO(MODEL_PATH)
+        device = YOLO_DEVICE
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device != "cpu":
+            app.state.yolo.to(device)
 
         # Modelo ultra rápido nativo en inglés.
-        app.state.ocr = TextRecognition(model_name="en_PP-OCRv4_mobile_rec")
+        app.state.ocr = TextRecognition(
+            model_name="en_PP-OCRv4_mobile_rec",
+        )
 
         print("Modelos cargados. Usa POST /camara/iniciar para abrir la camara.")
     else:
